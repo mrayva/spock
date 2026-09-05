@@ -1009,6 +1009,30 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 				 * already relies on, plus a length check since the wire
 				 * length must also match exactly for this fast path's
 				 * assumption to hold.
+				 *
+				 * KNOWN LIMITATION: this check, like the 'b' case's, only
+				 * covers the built-in OID range (att->atttypid/attrtype <
+				 * FirstNormalObjectId). Extension, enum, and domain type
+				 * OIDs are not stable across databases even for the
+				 * identical type -- verified directly: the same hstore
+				 * 1.8 extension, installed independently on two nodes,
+				 * gets different OIDs on each (e.g. 17506 vs 66314) -- so
+				 * comparing them numerically here would produce false
+				 * positives on correct, matching replication and can't be
+				 * used as a mismatch signal. The wire protocol itself
+				 * (spock_write_attrs()/spock_read_attrs() above) only
+				 * ever sends the column name and the type's raw OID, never
+				 * the type's own name/namespace, so there is currently no
+				 * data available at this point to validate a non-builtin
+				 * type mismatch. Confirmed live: a column independently
+				 * re-added as an extension type on one node and a
+				 * permissive-receive-function type (e.g. bytea) on
+				 * another still corrupts silently through this same 'i'
+				 * path, undetected by this check. Fixing that requires
+				 * the wire protocol to carry the type's qualified name
+				 * (at least for non-builtin OIDs), which is a materially
+				 * bigger, version-gated protocol change -- out of scope
+				 * for this fix, tracked separately.
 				 */
 				if (att->atttypid < FirstNormalObjectId &&
 					attrtype < FirstNormalObjectId &&

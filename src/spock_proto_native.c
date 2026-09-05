@@ -988,6 +988,47 @@ spock_read_tuple(StringInfo in, SpockRelation *rel,
 				tuple->changed[attid] = true;
 
 				len = pq_getmsgint(in, 4);	/* read length */
+
+				/*
+				 * The internal-format fast path assumes the sender's and
+				 * receiver's internal representations for this attribute
+				 * are byte-identical -- it carries no type information of
+				 * its own, unlike the 'b' format below. That assumption
+				 * silently breaks if the two nodes' schemas have diverged
+				 * (e.g. a column of the same name independently re-added
+				 * with a different type on each side, which nothing
+				 * prevents since DDL isn't replicated): the receiver would
+				 * reinterpret arbitrary bytes of one type as if they were
+				 * already a valid datum of a different, incompatible type.
+				 * For a pass-by-reference type expecting a varlena length
+				 * header (e.g. text), a mismatched fixed-width type's raw
+				 * bytes can decode as a bogus header claiming any length,
+				 * corrupting the stored value (observed as "compressed
+				 * pglz data is corrupt" on later read) or worse. Apply the
+				 * same trustworthy-OID mismatch check the 'b' case below
+				 * already relies on, plus a length check since the wire
+				 * length must also match exactly for this fast path's
+				 * assumption to hold.
+				 */
+				if (att->atttypid < FirstNormalObjectId &&
+					attrtype < FirstNormalObjectId &&
+					(att->atttypid != attrtype ||
+					 (att->attlen >= 0 && len != att->attlen)))
+				{
+					uint16		flags = FORMAT_TYPE_TYPEMOD_GIVEN | FORMAT_TYPE_ALLOW_INVALID;
+
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("internal-format data has type %u (%s) instead of expected %u (%s)",
+									attrtype,
+									format_type_extended(attrtype, attrtypmod, flags),
+									att->atttypid,
+									format_type_extended(att->atttypid, att->atttypmod, flags)),
+							 errdetail("check attribute '%s' of table '%s'",
+									   NameStr(att->attname),
+									   NameStr(rel->rel->rd_rel->relname))));
+				}
+
 				data = pq_getmsgbytes(in, len);
 
 				/* and data */

@@ -147,6 +147,32 @@ static uint64 apply_replay_bytes = 0;
 static bool apply_replay_mode = false;	/* true when replaying */
 static BufFile *apply_replay_spill_file = NULL;
 static bool apply_replay_spilling = false;
+
+/*
+ * Set by handle_startup() once the startup message has been fully
+ * processed. The main loop clears the replay queue when it sees this,
+ * after replication_handler() has returned and any need_free bookkeeping
+ * for the current entry is done.
+ *
+ * The startup message is queued like any other message (it arrives before
+ * any transaction and goes through the same queue_append path), but it must
+ * never survive to become the head of a later transaction's replay queue:
+ * unlike protocol v5+ data messages, it never carries a remote_insert_lsn
+ * field (see the comment on write_startup_message() in
+ * spock_proto_native.c), yet the generic per-message parsing in the main
+ * loop decides whether to consume that field based on the *currently
+ * negotiated* protocol version -- which, by the time anything replays this
+ * entry, is already >= 5 because processing this very message is what
+ * negotiated it. Replaying it later misparses the message 8 bytes out of
+ * alignment, landing the action-byte read inside the startup parameter
+ * text instead of on a real action byte.
+ *
+ * The reset can't happen inside handle_startup() itself: that would free
+ * the entry's data buffer (via apply_replay_queue_reset()'s PQfreemem)
+ * while the caller's `msg`/`entry` in the main loop still alias it for the
+ * remainder of this iteration.
+ */
+static bool apply_replay_queue_reset_pending = false;
 static int	apply_replay_spill_count = 0;
 static int	apply_replay_spill_read = 0;
 
@@ -2296,6 +2322,14 @@ handle_startup(StringInfo s)
 
 	/* Register callback for cleaning up */
 	before_shmem_exit(spock_apply_worker_shmem_exit, 0);
+
+	/*
+	 * This message must never be replayed later as if it were part of a
+	 * transaction's replay queue -- see the comment on
+	 * apply_replay_queue_reset_pending. Request a reset; the main loop
+	 * performs it once this message is fully done being processed.
+	 */
+	apply_replay_queue_reset_pending = true;
 }
 
 /*
@@ -3738,6 +3772,17 @@ stream_replay:
 
 					if (need_free)
 						apply_replay_entry_free(entry);
+
+					/*
+					 * Deferred from handle_startup() -- see the comment on
+					 * apply_replay_queue_reset_pending. Safe here: entry/msg
+					 * for this message are no longer used past this point.
+					 */
+					if (apply_replay_queue_reset_pending)
+					{
+						apply_replay_queue_reset();
+						apply_replay_queue_reset_pending = false;
+					}
 				}
 				else if (c == 'k')
 				{

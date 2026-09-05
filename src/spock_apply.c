@@ -1559,6 +1559,29 @@ log_insert_exception(bool failed, char *errmsg, SpockRelation *rel,
 }
 
 /*
+ * True for sqlerrcodes that apply_work()'s own PG_CATCH already retries
+ * indefinitely rather than treating as a permanent, discardable data fault
+ * (connection loss, deadlock/lock timeout, resource exhaustion -- see the
+ * detailed rationale on that PG_CATCH). Used by the read-time exception
+ * guards in handle_insert/handle_update/handle_delete below so a transient
+ * failure while decoding a message is never mistaken for a permanent one
+ * and wrongly discarded.
+ */
+static bool
+is_transient_apply_sqlerrcode(int sqlerrcode)
+{
+	return sqlerrcode == ERRCODE_CONNECTION_FAILURE ||
+		sqlerrcode == ERRCODE_CONNECTION_EXCEPTION ||
+		sqlerrcode == ERRCODE_CONNECTION_DOES_NOT_EXIST ||
+		sqlerrcode == ERRCODE_ADMIN_SHUTDOWN ||
+		sqlerrcode == ERRCODE_CRASH_SHUTDOWN ||
+		sqlerrcode == ERRCODE_CANNOT_CONNECT_NOW ||
+		sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED ||
+		sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE ||
+		ERRCODE_TO_CATEGORY(sqlerrcode) == ERRCODE_INSUFFICIENT_RESOURCES;
+}
+
+/*
  * All the memory operations of this function is covered under the
  * ApplyOperationContext's umbrella: in case of an error necessary data is
  * copied into more stable memory context in the upper CATCH section.
@@ -1586,7 +1609,60 @@ handle_insert(StringInfo s)
 
 	oldcontext = MemoryContextSwitchTo(ApplyOperationContext);
 
-	rel = spock_read_insert(s, RowExclusiveLock, &newtup);
+	if (MyApplyWorker->use_try_block)
+	{
+		/*
+		 * During replay, a decode-time fault (e.g. a schema mismatch
+		 * between providers -- see spock_read_tuple()'s internal-format
+		 * type check) must not be allowed to propagate uncaught: unlike
+		 * an apply-time fault, it recurs identically on every replay
+		 * attempt since the same wire bytes get re-decoded each time, and
+		 * replay-of-replay is fatal (see the "error during exception
+		 * handling" path in apply_work()'s own PG_CATCH), producing an
+		 * unbounded crash-restart loop instead of a clean discard. Catch
+		 * it here exactly like the existing rel==NULL ("can't find
+		 * relation") case just below already does for a different kind
+		 * of unreadable message -- but re-throw anything the outer
+		 * PG_CATCH already knows is transient and retries indefinitely,
+		 * so a genuinely transient failure (e.g. lock contention while
+		 * opening the relation) is never mistaken for a permanent one.
+		 */
+		PG_TRY();
+		{
+			BeginInternalSubTransaction(NULL);
+			rel = spock_read_insert(s, RowExclusiveLock, &newtup);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *read_edata;
+
+			MemoryContextSwitchTo(ApplyOperationContext);
+			read_edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcontext);
+
+			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
+				ReThrowError(read_edata);
+
+			xact_had_exception = true;
+			exception_command_counter++;
+			exception_log_ptr[my_exception_log_index].local_tuple = NULL;
+			log_insert_exception(true, errmsg_with_sqlstate(read_edata), NULL,
+								 NULL, NULL, "INSERT");
+
+			MemoryContextReset(ApplyOperationContext);
+			end_replication_step();
+			return;
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		rel = spock_read_insert(s, RowExclusiveLock, &newtup);
+	}
+
 	if (unlikely(rel == NULL))
 	{
 		Assert(MyApplyWorker->use_try_block);
@@ -1770,7 +1846,45 @@ handle_update(StringInfo s)
 	errcallback_arg.action_name = "UPDATE";
 	xact_action_counter++;
 
-	rel = spock_read_update(s, RowExclusiveLock, &hasoldtup, &oldtup, &newtup);
+	if (MyApplyWorker->use_try_block)
+	{
+		/* See the matching block in handle_insert() for the full rationale. */
+		PG_TRY();
+		{
+			BeginInternalSubTransaction(NULL);
+			rel = spock_read_update(s, RowExclusiveLock, &hasoldtup, &oldtup, &newtup);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *read_edata;
+
+			MemoryContextSwitchTo(ApplyOperationContext);
+			read_edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(ApplyOperationContext);
+
+			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
+				ReThrowError(read_edata);
+
+			xact_had_exception = true;
+			exception_command_counter++;
+			exception_log_ptr[my_exception_log_index].local_tuple = NULL;
+			log_insert_exception(true, errmsg_with_sqlstate(read_edata), NULL,
+								 NULL, NULL, "UPDATE");
+
+			MemoryContextReset(ApplyOperationContext);
+			end_replication_step();
+			return;
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		rel = spock_read_update(s, RowExclusiveLock, &hasoldtup, &oldtup, &newtup);
+	}
+
 	if (unlikely(rel == NULL))
 	{
 		Assert(MyApplyWorker->use_try_block);
@@ -1903,7 +2017,45 @@ handle_delete(StringInfo s)
 
 	begin_replication_step();
 
-	rel = spock_read_delete(s, RowExclusiveLock, &oldtup);
+	if (MyApplyWorker->use_try_block)
+	{
+		/* See the matching block in handle_insert() for the full rationale. */
+		PG_TRY();
+		{
+			BeginInternalSubTransaction(NULL);
+			rel = spock_read_delete(s, RowExclusiveLock, &oldtup);
+			ReleaseCurrentSubTransaction();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *read_edata;
+
+			MemoryContextSwitchTo(ApplyOperationContext);
+			read_edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(ApplyOperationContext);
+
+			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
+				ReThrowError(read_edata);
+
+			xact_had_exception = true;
+			exception_command_counter++;
+			exception_log_ptr[my_exception_log_index].local_tuple = NULL;
+			log_insert_exception(true, errmsg_with_sqlstate(read_edata), NULL,
+								 NULL, NULL, "DELETE");
+
+			MemoryContextReset(ApplyOperationContext);
+			end_replication_step();
+			return;
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		rel = spock_read_delete(s, RowExclusiveLock, &oldtup);
+	}
+
 	if (unlikely(rel == NULL))
 	{
 		Assert(MyApplyWorker->use_try_block);

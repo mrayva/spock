@@ -663,6 +663,59 @@ pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 }
 
 /*
+ * Does this walsender's own outgoing connection match an entry in
+ * synchronous_standby_names -- i.e. is this connection itself eligible to
+ * BE one of the synchronous standbys that setting requires?
+ *
+ * In a Spock mesh, every node runs one walsender per subscriber, and it's
+ * natural to configure synchronous_standby_names on a publisher to name
+ * its own subscribers' connections (e.g. "require any peer to confirm
+ * this write"). When that's the case, this walsender's own client
+ * connection is itself a candidate synchronous standby -- see the
+ * pg_decode_commit_txn() caller for why that matters.
+ *
+ * Deliberately NOT using core Postgres's own public
+ * SyncRepGetCandidateStandbys() (replication/syncrep.h) for this: that
+ * function only returns walsenders already in WALSNDSTATE_STREAMING, so a
+ * walsender still in WALSNDSTATE_CATCHUP -- e.g. right after a fresh
+ * connection, or shortly after a subscription was disabled and
+ * re-enabled -- would not yet be recognized as a candidate and would
+ * still call SyncRepWaitForLSN() below, recreating the identical deadlock
+ * during catchup (reaching "streaming" itself requires sending data, the
+ * exact thing this wait would block). Confirmed live: an earlier version
+ * of this function using SyncRepGetCandidateStandbys() left both of a
+ * fresh 2-node quorum stuck in catchup/potential state indefinitely.
+ *
+ * This instead mirrors core Postgres's own SyncRepGetStandbyPriority()
+ * (syncrep.c, static, not exported) -- walking the parsed
+ * synchronous_standby_names member list and comparing each entry against
+ * this connection's own application_name -- which only depends on the
+ * GUC configuration, not on this walsender's current catchup/streaming
+ * state.
+ */
+static bool
+spock_this_walsender_is_sync_candidate(void)
+{
+	const char *standby_name;
+	int			i;
+
+	if (SyncRepStandbyNames == NULL || SyncRepStandbyNames[0] == '\0' ||
+		SyncRepConfig == NULL)
+		return false;
+
+	standby_name = SyncRepConfig->member_names;
+	for (i = 0; i < SyncRepConfig->nmembers; i++)
+	{
+		if (pg_strcasecmp(standby_name, application_name) == 0 ||
+			strcmp(standby_name, "*") == 0)
+			return true;
+		standby_name += strlen(standby_name) + 1;
+	}
+
+	return false;
+}
+
+/*
  * COMMIT callback
  */
 static void
@@ -712,6 +765,48 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	{
 		elog(LOG, "Spock: walsender idx too big (%d) - "
 			 " not calling SyncRepWaitForLSN()", MyWalSenderIdx);
+	}
+	else if (spock_this_walsender_is_sync_candidate())
+	{
+		/*
+		 * This walsender's own outgoing connection itself matches one of
+		 * the names configured in synchronous_standby_names -- e.g. a
+		 * Spock mesh peer's inbound
+		 * subscription to this same publisher, required by the exact same
+		 * synchronous_standby_names setting this wait would block on.
+		 *
+		 * Calling SyncRepWaitForLSN() here would self-deadlock: every
+		 * walsender decoding this same commit for every other name in
+		 * synchronous_standby_names hits this identical wait at the same
+		 * time, and none of them can ever satisfy it, because doing so
+		 * requires *sending* this transaction to its own client -- the
+		 * exact step each one is blocked before. Confirmed live: with
+		 * this guard absent, every write on the publisher hung forever
+		 * the moment synchronous_standby_names named the mesh's own peer
+		 * connections (see spock_syncrep_walsender_stall_finding in the
+		 * pg_scripts memory notes for the full reproduction).
+		 *
+		 * Skipping the wait here does not weaken the durability guarantee
+		 * for the common case (a client committing with synchronous_commit
+		 * at remote_write or higher): that client is already blocked in
+		 * the *standard*, unrelated SyncRepWaitForLSN() call core Postgres
+		 * makes from its own COMMIT processing (xact.c), which requires
+		 * the exact same synchronous_standby_names quorum before letting
+		 * the client's COMMIT return -- entirely independent of this
+		 * output plugin. This walsender-level wait only adds protection
+		 * for a client that used a weaker synchronous_commit (off/local)
+		 * whose own commit didn't wait at all; that narrower protection is
+		 * unavailable in a self-referential mesh configuration (there is
+		 * no separate entity here to lose sync with -- the "standby" this
+		 * check would protect against forgetting the transaction is the
+		 * same connection about to receive it), so there's nothing unsafe
+		 * being skipped, only a redundant wait that couldn't be satisfied.
+		 */
+		elog(DEBUG1, "SPOCK: this walsender is itself a synchronous-standby "
+			 "candidate for synchronous_standby_names -- skipping the "
+			 "walsender-level SyncRepWaitForLSN() to avoid a "
+			 "self-referential deadlock (the standard per-commit wait in "
+			 "the originating client's own COMMIT still applies)");
 	}
 	else
 	{

@@ -1657,6 +1657,34 @@ handle_insert(StringInfo s)
 		{
 			BeginInternalSubTransaction(NULL);
 			rel = spock_read_insert(s, RowExclusiveLock, &newtup);
+
+			/*
+			 * spock_read_insert() opens the target relation as a side
+			 * effect of decoding the tuple, and that reference is meant to
+			 * outlive this subtransaction -- the caller closes it itself
+			 * once the change (or, for spock.queue, the queued message)
+			 * has been applied. ReleaseCurrentSubTransaction() doesn't
+			 * know that: it treats any relcache reference still open under
+			 * the subtransaction's resource owner as a leak, warns
+			 * "resource was not closed", and force-closes it -- leaving
+			 * the caller's later spock_relation_close() to fail with
+			 * "relcache reference ... is not owned by resource owner
+			 * TopTransaction", since the reference was never registered
+			 * under the parent owner. Take a second reference under the
+			 * parent before releasing, so one survives for the caller; the
+			 * subtransaction's own reference still gets force-closed (and
+			 * still logs the warning) below, which is expected and
+			 * harmless.
+			 */
+			if (rel != NULL)
+			{
+				ResourceOwner subxact_owner = CurrentResourceOwner;
+
+				CurrentResourceOwner = ResourceOwnerGetParent(subxact_owner);
+				RelationIncrementReferenceCount(rel->rel);
+				CurrentResourceOwner = subxact_owner;
+			}
+
 			ReleaseCurrentSubTransaction();
 		}
 		PG_CATCH();
@@ -1879,6 +1907,17 @@ handle_update(StringInfo s)
 		{
 			BeginInternalSubTransaction(NULL);
 			rel = spock_read_update(s, RowExclusiveLock, &hasoldtup, &oldtup, &newtup);
+
+			/* See the matching block in handle_insert() for the full rationale. */
+			if (rel != NULL)
+			{
+				ResourceOwner subxact_owner = CurrentResourceOwner;
+
+				CurrentResourceOwner = ResourceOwnerGetParent(subxact_owner);
+				RelationIncrementReferenceCount(rel->rel);
+				CurrentResourceOwner = subxact_owner;
+			}
+
 			ReleaseCurrentSubTransaction();
 		}
 		PG_CATCH();
@@ -2050,6 +2089,17 @@ handle_delete(StringInfo s)
 		{
 			BeginInternalSubTransaction(NULL);
 			rel = spock_read_delete(s, RowExclusiveLock, &oldtup);
+
+			/* See the matching block in handle_insert() for the full rationale. */
+			if (rel != NULL)
+			{
+				ResourceOwner subxact_owner = CurrentResourceOwner;
+
+				CurrentResourceOwner = ResourceOwnerGetParent(subxact_owner);
+				RelationIncrementReferenceCount(rel->rel);
+				CurrentResourceOwner = subxact_owner;
+			}
+
 			ReleaseCurrentSubTransaction();
 		}
 		PG_CATCH();

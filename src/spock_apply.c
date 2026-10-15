@@ -1806,6 +1806,15 @@ handle_insert(StringInfo s)
 			read_edata = CopyErrorData();
 			FlushErrorState();
 			RollbackAndReleaseCurrentSubTransaction();
+			/*
+			 * spock_read_*() opened the relation inside the subtransaction just
+			 * rolled back, which released the relcache reference but left the
+			 * Spock relation cache holding a dangling ->rel; the next transaction
+			 * would reuse it and fail to close it ("not owned by resource owner
+			 * TopTransaction"), discarding an unrelated good transaction.
+			 * Invalidate so the next open re-resolves the relation.
+			 */
+			spock_relation_cache_reset();
 			MemoryContextSwitchTo(oldcontext);
 
 			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
@@ -2041,6 +2050,15 @@ handle_update(StringInfo s)
 			read_edata = CopyErrorData();
 			FlushErrorState();
 			RollbackAndReleaseCurrentSubTransaction();
+			/*
+			 * spock_read_*() opened the relation inside the subtransaction just
+			 * rolled back, which released the relcache reference but left the
+			 * Spock relation cache holding a dangling ->rel; the next transaction
+			 * would reuse it and fail to close it ("not owned by resource owner
+			 * TopTransaction"), discarding an unrelated good transaction.
+			 * Invalidate so the next open re-resolves the relation.
+			 */
+			spock_relation_cache_reset();
 			MemoryContextSwitchTo(ApplyOperationContext);
 
 			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
@@ -2223,6 +2241,15 @@ handle_delete(StringInfo s)
 			read_edata = CopyErrorData();
 			FlushErrorState();
 			RollbackAndReleaseCurrentSubTransaction();
+			/*
+			 * spock_read_*() opened the relation inside the subtransaction just
+			 * rolled back, which released the relcache reference but left the
+			 * Spock relation cache holding a dangling ->rel; the next transaction
+			 * would reuse it and fail to close it ("not owned by resource owner
+			 * TopTransaction"), discarding an unrelated good transaction.
+			 * Invalidate so the next open re-resolves the relation.
+			 */
+			spock_relation_cache_reset();
 			MemoryContextSwitchTo(ApplyOperationContext);
 
 			if (is_transient_apply_sqlerrcode(read_edata->sqlerrcode))
